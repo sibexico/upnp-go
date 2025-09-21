@@ -1,3 +1,5 @@
+[![Go Report Card](https://goreportcard.com/badge/github.com/sibexico/upnp-go)](https://goreportcard.com/report/github.com/sibexico/upnp-go)  [![Go 1.25.1](https://badgen.net/static/Go/1.25.1/blue)]  
+
 # **upnp-go**
 
 Implementation of the uPNP port forwarding in PURE standard Go without dependencies. Advanced features for maximum reliability was implemented. It mostly covered with tests as well. The code is fully commented.
