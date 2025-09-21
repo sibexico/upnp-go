@@ -1,4 +1,4 @@
-[![Go Report Card](https://goreportcard.com/badge/github.com/sibexico/upnp-go)](https://goreportcard.com/report/github.com/sibexico/upnp-go)  [![Go 1.25.1](https://badgen.net/static/Go/1.25.1/blue)]  
+[![Go Report Card](https://goreportcard.com/badge/github.com/sibexico/upnp-go)](https://goreportcard.com/report/github.com/sibexico/upnp-go)  [![Go 1.25.1](https://badgen.net/static/Go/1.25.1/blue)](https://tip.golang.org/doc/go1.25)
 
 # **upnp-go**
 
