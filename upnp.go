@@ -431,7 +431,13 @@ func (d *IGD) performSOAPActionWithContext(ctx context.Context, action string, r
 	return nil
 }
 
+// getInternalIP determines the client's internal IP address that is on the same
+// subnet as the gateway device. It caches the result for subsequent calls.
+// This is a crucial step to ensure that port forwarding requests are made
+// with the correct source IP.
 func (d *IGD) getInternalIP() (string, error) {
+	// First, check if the IP has already been determined and cached.
+	// A read-lock is used for this check to allow concurrent reads.
 	d.internalIPMu.RLock()
 	if d.internalIP != "" {
 		ip := d.internalIP
@@ -439,42 +445,68 @@ func (d *IGD) getInternalIP() (string, error) {
 		return ip, nil
 	}
 	d.internalIPMu.RUnlock()
+
+	// If the IP is not cached, acquire a write-lock to perform the discovery.
 	d.internalIPMu.Lock()
 	defer d.internalIPMu.Unlock()
+	// Double-check if another goroutine has determined the IP while waiting for the lock.
 	if d.internalIP != "" {
 		return d.internalIP, nil
 	}
+
+	// Parse the device's location URL to get the gateway's host/IP address.
+	// For example: "http://192.168.1.1:49152/rootDesc.xml" -> "192.168.1.1"
 	deviceURL, err := url.Parse(d.device.Location)
 	if err != nil {
 		return "", fmt.Errorf("%w: failed to parse device location: %v", ErrNoInternalIP, err)
 	}
+
 	host, _, _ := net.SplitHostPort(deviceURL.Host)
 	if host == "" {
 		host = deviceURL.Host
 	}
+
+	// Convert the gateway's host string to a net.IP object.
 	devIP := net.ParseIP(host)
 	if devIP == nil {
 		return "", fmt.Errorf("%w: could not parse router IP from %s", ErrNoInternalIP, host)
 	}
+
+	// Get a list of all network interfaces on this machine.
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return "", fmt.Errorf("%w: failed to get network interfaces: %v", ErrNoInternalIP, err)
 	}
+
+	// Iterate over each interface to find the one on the same network as the gateway.
 	for _, iface := range ifaces {
+		// Skip interfaces that are down or not suitable for communication.
 		if iface.Flags&net.FlagUp == 0 {
 			continue
 		}
+
+		// Get all IP addresses associated with this interface.
 		addrs, err := iface.Addrs()
 		if err != nil {
 			continue
 		}
+
+		// Iterate over each address for the current interface.
 		for _, addr := range addrs {
-			if ipNet, ok := addr.(*net.IPNet); ok && ipNet.Contains(devIP) && !ipNet.IP.IsLoopback() {
-				d.internalIP = ipNet.IP.String()
-				return d.internalIP, nil
+			// The address is expected to be of type *net.IPNet, which contains the IP and subnet mask.
+			if ipNet, ok := addr.(*net.IPNet); ok {
+				// The core logic: check if the gateway's IP is within the subnet of this address.
+				// Also, ensure it's not a loopback address.
+				if ipNet.Contains(devIP) && !ipNet.IP.IsLoopback() {
+					// Found the correct local IP. Cache it and return.
+					d.internalIP = ipNet.IP.String()
+					return d.internalIP, nil
+				}
 			}
 		}
 	}
+
+	// If no suitable interface/IP was found after checking all of them, return an error.
 	return "", ErrNoInternalIP
 }
 
