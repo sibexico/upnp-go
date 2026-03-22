@@ -290,3 +290,27 @@ func TestGetPortMappingNotFound(t *testing.T) {
 		t.Fatalf("Expected ErrPortNotForwarded, got: %v", err)
 	}
 }
+
+func TestForwardProtocolInvalidProtocol(t *testing.T) {
+	gw := newMockGateway()
+	defer gw.Close()
+
+	igd, err := gw.getIGDClient()
+	if err != nil {
+		t.Fatalf("Failed to create IGD client: %v", err)
+	}
+	igd.internalIP = "192.168.1.100"
+
+	err = igd.ForwardProtocol(8080, Protocol("ICMP"), "Invalid Protocol")
+	if !errors.Is(err, ErrInvalidProtocol) {
+		t.Fatalf("Expected ErrInvalidProtocol, got: %v", err)
+	}
+}
+
+func TestExternalIPNilIGD(t *testing.T) {
+	var igd *IGD
+	_, err := igd.ExternalIPCtx(context.Background())
+	if err == nil {
+		t.Fatal("Expected error for nil IGD receiver")
+	}
+}

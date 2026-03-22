@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,6 +24,8 @@ var (
 	ErrPortNotForwarded = errors.New("port is not forwarded")
 	// ErrInvalidPort is returned for port numbers that are out of the valid range (i.e., 0).
 	ErrInvalidPort = errors.New("invalid port number")
+	// ErrInvalidProtocol is returned when the requested protocol is not supported.
+	ErrInvalidProtocol = errors.New("invalid protocol")
 	// ErrNoInternalIP is returned when the local IP address of the client cannot be determined.
 	ErrNoInternalIP = errors.New("could not determine internal IP")
 	// ErrSOAPAction is returned when a SOAP request to the gateway fails.
@@ -143,6 +144,35 @@ type upnpError struct {
 	ErrorDescription string `xml:"errorDescription"`
 }
 
+type soapActionError struct {
+	httpStatus      int
+	faultCode       string
+	faultString     string
+	upnpCode        int
+	upnpDescription string
+	body            string
+}
+
+func (e *soapActionError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.upnpCode != 0 {
+		return fmt.Sprintf("%v: UPnP Error %d: %s", ErrSOAPAction, e.upnpCode, e.upnpDescription)
+	}
+	if e.faultCode != "" || e.faultString != "" {
+		return fmt.Sprintf("%v: %s - %s", ErrSOAPAction, e.faultCode, e.faultString)
+	}
+	if e.httpStatus != 0 {
+		return fmt.Sprintf("%v: HTTP %d: %s", ErrSOAPAction, e.httpStatus, e.body)
+	}
+	return ErrSOAPAction.Error()
+}
+
+func (e *soapActionError) Unwrap() error {
+	return ErrSOAPAction
+}
+
 type getExternalIPRequest struct {
 	XMLName xml.Name `xml:"u:GetExternalIPAddress"`
 	XMLNS   string   `xml:"xmlns:u,attr"`
@@ -198,8 +228,8 @@ func (d *IGD) ExternalIP() (string, error) {
 
 // ExternalIPCtx retrieves the external IP address of the gateway using a context.
 func (d *IGD) ExternalIPCtx(ctx context.Context) (string, error) {
-	if d.device == nil {
-		return "", errors.New("IGD device is nil")
+	if err := d.ensureDevice(); err != nil {
+		return "", err
 	}
 	req := getExternalIPRequest{
 		XMLNS: d.device.ServiceType,
@@ -244,6 +274,12 @@ func (d *IGD) GetPortMapping(port uint16, protocol Protocol) (*PortMapping, erro
 	if err := validatePort(port); err != nil {
 		return nil, err
 	}
+	if err := validateProtocol(protocol); err != nil {
+		return nil, err
+	}
+	if err := d.ensureDevice(); err != nil {
+		return nil, err
+	}
 	req := getSpecificPortMappingRequest{
 		XMLNS:        d.device.ServiceType,
 		RemoteHost:   "",
@@ -253,7 +289,7 @@ func (d *IGD) GetPortMapping(port uint16, protocol Protocol) (*PortMapping, erro
 	var resp getSpecificPortMappingResponse
 	err := d.performSOAPAction("GetSpecificPortMappingEntry", req, &resp)
 	if err != nil {
-		if strings.Contains(err.Error(), "714") || strings.Contains(err.Error(), "NoSuchEntryInArray") {
+		if isNoSuchEntryError(err) {
 			return nil, ErrPortNotForwarded
 		}
 		return nil, fmt.Errorf("failed to get port mapping: %w", err)
@@ -280,7 +316,13 @@ func (d *IGD) Forward(port uint16, desc string) error {
 		return fmt.Errorf("failed to forward TCP port %d: %w", port, err)
 	}
 	if err := d.ForwardUDP(port, desc); err != nil {
-		d.ClearTCP(port)
+		rollbackErr := d.ClearTCP(port)
+		if rollbackErr != nil {
+			return errors.Join(
+				fmt.Errorf("failed to forward UDP port %d: %w", port, err),
+				fmt.Errorf("failed to rollback TCP port %d: %w", port, rollbackErr),
+			)
+		}
 		return fmt.Errorf("failed to forward UDP port %d: %w", port, err)
 	}
 	return nil
@@ -290,6 +332,12 @@ func (d *IGD) Forward(port uint16, desc string) error {
 // It maps the external port to the same internal port on the client's internal IP address.
 func (d *IGD) ForwardProtocol(port uint16, protocol Protocol, desc string) error {
 	if err := validatePort(port); err != nil {
+		return err
+	}
+	if err := validateProtocol(protocol); err != nil {
+		return err
+	}
+	if err := d.ensureDevice(); err != nil {
 		return err
 	}
 	ip, err := d.getInternalIP()
@@ -343,6 +391,12 @@ func (d *IGD) ClearProtocol(port uint16, protocol Protocol) error {
 	if err := validatePort(port); err != nil {
 		return err
 	}
+	if err := validateProtocol(protocol); err != nil {
+		return err
+	}
+	if err := d.ensureDevice(); err != nil {
+		return err
+	}
 	req := deletePortMappingRequest{
 		XMLNS:        d.device.ServiceType,
 		RemoteHost:   "",
@@ -368,6 +422,9 @@ func (d *IGD) ClearUDP(port uint16) error {
 
 // Location returns the URL of the gateway's device description XML file.
 func (d *IGD) Location() string {
+	if d == nil {
+		return ""
+	}
 	if d.device == nil {
 		return ""
 	}
@@ -379,6 +436,13 @@ func (d *IGD) performSOAPAction(action string, request, response interface{}) er
 }
 
 func (d *IGD) performSOAPActionWithContext(ctx context.Context, action string, request, response interface{}) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := d.ensureSOAPReady(); err != nil {
+		return err
+	}
+
 	fullRequest := soapRequestEnvelope{
 		XMLNS:    "http://schemas.xmlsoap.org/soap/envelope/",
 		Encoding: "http://schemas.xmlsoap.org/soap/encoding/",
@@ -410,23 +474,80 @@ func (d *IGD) performSOAPActionWithContext(ctx context.Context, action string, r
 		return fmt.Errorf("failed to read response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%w: HTTP %d: %s", ErrSOAPAction, resp.StatusCode, string(respBody))
+		if faultErr := parseSOAPFault(respBody); faultErr != nil {
+			faultErr.httpStatus = resp.StatusCode
+			return faultErr
+		}
+		return &soapActionError{httpStatus: resp.StatusCode, body: string(respBody)}
 	}
 	if response != nil {
 		respEnvelope := soapResponseEnvelope{Body: soapResponseBody{Action: response}}
 		err = xml.Unmarshal(respBody, &respEnvelope)
 		if err != nil {
-			var fault soapFault
-			// Unmarshal as a wrong response
-			faultEnvelope := soapResponseEnvelope{Body: soapResponseBody{Action: &fault}}
-			if xml.Unmarshal(respBody, &faultEnvelope) == nil && (fault.Code != "" || fault.Detail.UPnPError.ErrorCode != 0) {
-				if fault.Detail.UPnPError.ErrorCode != 0 {
-					return fmt.Errorf("%w: UPnP Error %d: %s", ErrSOAPAction, fault.Detail.UPnPError.ErrorCode, fault.Detail.UPnPError.ErrorDescription)
-				}
-				return fmt.Errorf("%w: %s - %s", ErrSOAPAction, fault.Code, fault.String)
+			if faultErr := parseSOAPFault(respBody); faultErr != nil {
+				return faultErr
 			}
 			return fmt.Errorf("failed to parse SOAP response: %w", err)
 		}
+	}
+	return nil
+}
+
+func parseSOAPFault(respBody []byte) *soapActionError {
+	var fault soapFault
+	faultEnvelope := soapResponseEnvelope{Body: soapResponseBody{Action: &fault}}
+	if xml.Unmarshal(respBody, &faultEnvelope) != nil {
+		return nil
+	}
+
+	if fault.Detail.UPnPError.ErrorCode != 0 {
+		return &soapActionError{
+			upnpCode:        fault.Detail.UPnPError.ErrorCode,
+			upnpDescription: fault.Detail.UPnPError.ErrorDescription,
+		}
+	}
+	if fault.Code != "" || fault.String != "" {
+		return &soapActionError{faultCode: fault.Code, faultString: fault.String}
+	}
+
+	return nil
+}
+
+func isNoSuchEntryError(err error) bool {
+	var soapErr *soapActionError
+	if errors.As(err, &soapErr) {
+		if soapErr.upnpCode == 714 {
+			return true
+		}
+		if strings.EqualFold(soapErr.upnpDescription, "NoSuchEntryInArray") {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *IGD) ensureDevice() error {
+	if d == nil {
+		return errors.New("IGD is nil")
+	}
+	if d.device == nil {
+		return errors.New("IGD device is nil")
+	}
+	if d.device.ServiceType == "" {
+		return errors.New("IGD service type is empty")
+	}
+	return nil
+}
+
+func (d *IGD) ensureSOAPReady() error {
+	if err := d.ensureDevice(); err != nil {
+		return err
+	}
+	if d.httpClient == nil {
+		return errors.New("IGD HTTP client is nil")
+	}
+	if d.device.ControlURL == "" {
+		return errors.New("IGD control URL is empty")
 	}
 	return nil
 }
@@ -465,6 +586,7 @@ func (d *IGD) getInternalIP() (string, error) {
 	if host == "" {
 		host = deviceURL.Host
 	}
+	host = strings.Trim(host, "[]")
 
 	// Convert the gateway's host string to a net.IP object.
 	devIP := net.ParseIP(host)
@@ -517,6 +639,13 @@ func validatePort(port uint16) error {
 	return nil
 }
 
+func validateProtocol(protocol Protocol) error {
+	if protocol != ProtocolTCP && protocol != ProtocolUDP {
+		return fmt.Errorf("%w: %q", ErrInvalidProtocol, protocol)
+	}
+	return nil
+}
+
 // Discover searches the local network for a UPnP-enabled Internet Gateway Device.
 // It returns an IGD instance if a compatible device is found.
 // If no device is found, it returns ErrNoGateway. The discovery process times out after 10 seconds.
@@ -530,6 +659,9 @@ func Discover() (*IGD, error) {
 // It returns an IGD instance if a compatible device is found.
 // If no device is found or the context is canceled, it returns an error.
 func DiscoverCtx(ctx context.Context) (*IGD, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		return nil, fmt.Errorf("failed to list network interfaces: %w", err)
@@ -551,9 +683,9 @@ func DiscoverCtx(ctx context.Context) (*IGD, error) {
 	for device := range deviceCh {
 		igd, err := LoadCtx(ctx, device.Location)
 		if err == nil {
+			cancel()
 			return igd, nil
 		}
-		log.Printf("DEBUG: Failed to validate device at %s: %v", device.Location, err)
 	}
 	return nil, ErrNoGateway
 }
@@ -591,9 +723,6 @@ func discoverOnInterface(ctx context.Context, wg *sync.WaitGroup, iface net.Inte
 			}
 			defer conn.Close()
 
-			deadline, _ := ctx.Deadline()
-			conn.SetDeadline(deadline)
-
 			searchTargets := []string{
 				"urn:schemas-upnp-org:device:InternetGatewayDevice:1",
 				"ssdp:rootdevice",
@@ -608,6 +737,7 @@ func discoverOnInterface(ctx context.Context, wg *sync.WaitGroup, iface net.Inte
 				requestBytes.WriteString("MX: 2\r\n")
 				requestBytes.WriteString(fmt.Sprintf("ST: %s\r\n", target))
 				requestBytes.WriteString("\r\n")
+				_ = conn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
 				_, err := conn.WriteToUDP(requestBytes.Bytes(), mcastAddr)
 				if err != nil {
 					continue
@@ -616,9 +746,19 @@ func discoverOnInterface(ctx context.Context, wg *sync.WaitGroup, iface net.Inte
 
 			respBuf := make([]byte, 2048)
 			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 				n, _, err := conn.ReadFromUDP(respBuf)
 				if err != nil {
-					// The way to exit the loop
+					var nerr net.Error
+					if errors.As(err, &nerr) && nerr.Timeout() {
+						continue
+					}
 					return
 				}
 
@@ -689,7 +829,6 @@ func findWANServiceByBruteForce(ctx context.Context, dev device, baseURL *url.UR
 		}
 		_, err = tempIGD.ExternalIPCtx(ctx)
 		if err == nil {
-			log.Printf("DEBUG: Brute-force success! Found active WAN service: %s", svc.ServiceType)
 			return testDevice
 		}
 	}
@@ -734,7 +873,6 @@ func fetchDeviceDescription(ctx context.Context, location string) (*Device, erro
 	foundDevice := findWANService(desc.Device, baseURL)
 
 	if foundDevice == nil {
-		log.Println("DEBUG: Standard service search failed. Trying brute-force discovery...")
 		foundDevice = findWANServiceByBruteForce(ctx, desc.Device, baseURL)
 	}
 
